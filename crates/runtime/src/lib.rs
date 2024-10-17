@@ -9,244 +9,265 @@
 #![warn(clippy::pedantic, missing_docs)]
 #![allow(clippy::module_name_repetitions)]
 
-use std::fmt;
+//! Vixen provides a simple API for requesting, parsing, and consuming data
+//! from Yellowstone.
 
-use buffer::BufferOpts;
+use builder::RuntimeBuilder;
+use config::{BufferConfig, YellowstoneConfig};
+use futures_util::future::OptionFuture;
+use metrics::{Counters, Exporter, MetricsFactory, NullMetrics};
+use stop::{StopCode, StopTx};
 use tokio::task::LocalSet;
-use vixen_core::{AccountUpdate, TransactionUpdate};
-use yellowstone::YellowstoneOpts;
 
+#[cfg(feature = "opentelemetry")]
+pub extern crate opentelemetry;
+#[cfg(feature = "prometheus")]
+pub extern crate prometheus;
+pub extern crate thiserror;
 pub extern crate yellowstone_vixen_core as vixen_core;
+pub use vixen_core::bs58;
+#[cfg(feature = "stream")]
+pub extern crate yellowstone_vixen_proto as proto;
 
 mod buffer;
+pub mod builder;
+pub mod config;
 pub mod handler;
+pub mod instruction;
+pub mod metrics;
+#[cfg(feature = "stream")]
+pub mod stream;
+mod util;
 mod yellowstone;
 
-pub use handler::{
-    DynHandlerPack, Handler, HandlerManager, HandlerManagers, HandlerPack, HandlerResult,
-};
+pub use handler::{Handler, HandlerResult, Pipeline};
+pub use util::*;
 
+/// An error thrown by the Vixen runtime.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// A system I/O error.
     #[error("I/O error")]
     Io(#[from] std::io::Error),
+    /// An error returned by a Yellowstone server.
     #[error("Yellowstone gRPC error")]
     Yellowstone(#[from] yellowstone::Error),
+    /// An error occurring when the Yellowstone client stops early.
     #[error("Yellowstone client crashed")]
     ClientHangup,
+    /// An error occurring when the Yellowstone server closes the connection.
     #[error("Yellowstone stream hung up unexpectedly")]
     ServerHangup,
+    /// A gRPC error returned by the Yellowstone server.
     #[error("Yellowstone stream returned an error")]
     YellowstoneStatus(#[from] yellowstone_grpc_proto::tonic::Status),
+    /// An error caused by the metrics exporter.
+    #[error("Error exporting metrics")]
+    MetricsExporter(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
 }
 
-#[derive(Debug, clap::Args, serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub struct IndexerOpts {
-    #[command(flatten)]
-    yellowstone: YellowstoneOpts,
-
-    #[command(flatten)]
-    #[serde(default)]
-    buffer: BufferOpts,
+/// The main runtime for Vixen.
+#[derive(Debug)]
+pub struct Runtime<M: MetricsFactory> {
+    yellowstone_cfg: YellowstoneConfig,
+    buffer_cfg: BufferConfig,
+    pipelines: handler::PipelineSets,
+    counters: Counters<M::Instrumenter>,
+    exporter: Option<M::Exporter>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Chain<'a, E>(&'a E);
+impl Runtime<NullMetrics> {
+    /// Create a new runtime builder.
+    pub fn builder() -> RuntimeBuilder { RuntimeBuilder::default() }
+}
 
-impl<'a, E: std::error::Error> fmt::Display for Chain<'a, E> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use fmt::Write;
+impl<M: MetricsFactory> Runtime<M> {
+    /// Create a new Tokio runtime and run the Vixen runtime within it,
+    /// terminating the current process if the runtime crashes.
+    #[inline]
+    pub fn run(self) { util::handle_fatal(self.try_run()); }
 
-        enum IndentState {
-            NumberStart(usize), // Numbered and indented initial line
-            PlainStart,         // Plain indented initial line
-            HangStart,          // Hanging indent for successive lines
-            MidLine,            // No indent, not at line start
+    /// Create a new Tokio runtime and run the Vixen runtime within it.
+    ///
+    /// # Errors
+    /// This function returns an error if the runtime crashes.
+    #[inline]
+    pub fn try_run(self) -> Result<(), Error> {
+        util::tokio_runtime()?.block_on(self.try_run_async())
+    }
+
+    /// Create a new [`LocalSet`] and run the Vixen runtime within it,
+    /// terminating the current process if the runtime crashes.
+    ///
+    /// **NOTE:** This function **must** be called from within a Tokio runtime.
+    #[inline]
+    pub async fn run_async(self) { util::handle_fatal(self.try_run_async().await); }
+
+    /// Create a new [`LocalSet`] and run the Vixen runtime within it.
+    ///
+    /// **NOTE:** This function **must** be called from within a Tokio runtime.
+    ///
+    /// # Errors
+    /// This function returns an error if the runtime crashes.
+    #[inline]
+    pub async fn try_run_async(self) -> Result<(), Error> {
+        LocalSet::new().run_until(self.try_run_local()).await
+    }
+
+    /// Run the Vixen runtime.
+    ///
+    /// **NOTE:** This function **must** be called from within a Tokio
+    /// [`LocalSet`].
+    ///
+    /// # Errors
+    /// This function returns an error if the runtime crashes.
+    #[tracing::instrument("Runtime::run", skip(self))]
+    pub async fn try_run_local(self) -> Result<(), Error> {
+        enum StopType<S, X> {
+            Signal(S),
+            Buffer(Result<std::convert::Infallible, Error>),
+            Exporter(Result<Result<stop::StopCode, X>, tokio::task::JoinError>),
         }
 
-        struct Indented<'a, F> {
-            f: &'a mut F,
-            state: IndentState,
+        let Self {
+            yellowstone_cfg,
+            buffer_cfg,
+            pipelines,
+            counters,
+            exporter,
+        } = self;
+
+        let (stop_exporter, rx) = stop::channel();
+        let mut exporter = OptionFuture::from(exporter.map(|e| tokio::spawn(e.run(rx))));
+
+        let client = yellowstone::connect(yellowstone_cfg, pipelines.filters()).await?;
+        let signal;
+
+        #[cfg(unix)]
+        {
+            use futures_util::stream::{FuturesUnordered, StreamExt};
+            use tokio::signal::unix::SignalKind;
+
+            let mut stream = [
+                SignalKind::hangup(),
+                SignalKind::interrupt(),
+                SignalKind::quit(),
+                SignalKind::terminate(),
+            ]
+            .into_iter()
+            .map(|k| {
+                tokio::signal::unix::signal(k).map(|mut s| async move {
+                    s.recv().await;
+                    Ok(k)
+                })
+            })
+            .collect::<Result<FuturesUnordered<_>, _>>()?;
+
+            signal = async move { stream.next().await.transpose() }
         }
 
-        impl<'a, F: Write> Indented<'a, F> {
-            fn write_pad(&mut self) -> fmt::Result {
-                match std::mem::replace(&mut self.state, IndentState::MidLine) {
-                    IndentState::NumberStart(i) => write!(self.f, "{i: >5}: "),
-                    IndentState::PlainStart => write!(self.f, "    "),
-                    IndentState::HangStart => write!(self.f, "      "),
-                    IndentState::MidLine => Ok(()),
-                }
+        #[cfg(not(unix))]
+        {
+            use std::fmt;
+
+            use futures_util::TryFutureExt;
+
+            struct CtrlC;
+
+            impl fmt::Debug for CtrlC {
+                fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { f.write_str("^C") }
             }
+
+            signal = tokio::signal::ctrl_c()
+                .map_ok(|()| Some(CtrlC))
+                .map_err(Into::into);
         }
 
-        impl<'a, F: Write> Write for Indented<'a, F> {
-            fn write_str(&mut self, mut s: &str) -> fmt::Result {
-                while let Some((head, tail)) = s.split_once('\n') {
-                    if !head.is_empty() {
-                        self.write_pad()?;
-                    }
-                    self.f.write_str(head)?;
-                    self.f.write_char('\n')?;
-                    self.state = IndentState::HangStart;
-                    s = tail;
-                }
+        let mut buffer = buffer::Buffer::run_yellowstone(buffer_cfg, client, pipelines, counters);
 
-                let trail = !s.is_empty();
-                if trail {
-                    self.write_pad()?;
-                }
-                self.f.write_str(s)?;
-                self.state = if trail {
-                    IndentState::MidLine
-                } else {
-                    IndentState::HangStart
-                };
+        let stop_ty = tokio::select! {
+            s = signal => StopType::Signal(s),
+            b = buffer.wait_for_stop() => StopType::Buffer(b),
+            Some(x) = &mut exporter => StopType::Exporter(x),
+        };
+
+        let should_stop_buffer = !matches!(stop_ty, StopType::Buffer(..));
+        let should_stop_exporter = !matches!(stop_ty, StopType::Exporter(..));
+
+        match stop_ty {
+            StopType::Signal(Ok(Some(s))) => {
+                tracing::warn!("{s:?} received, shutting down...");
                 Ok(())
-            }
+            },
+            StopType::Signal(Ok(None)) => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "Signal handler returned None",
+            )
+            .into()),
+            // Not sure why the compiler couldn't figure this one out
+            StopType::Buffer(Ok(o)) => match o {},
+            StopType::Signal(Err(e)) | StopType::Buffer(Err(e)) => Err(e),
+            StopType::Exporter(Ok(Ok(..))) => {
+                Err(Error::MetricsExporter("Exporter stopped early".into()))
+            },
+            StopType::Exporter(Ok(Err(e))) => Err(Error::MetricsExporter(e.into())),
+            StopType::Exporter(Err(e)) => Err(Error::MetricsExporter(e.into())),
+        }?;
+
+        if should_stop_buffer {
+            Self::stop_buffer(buffer).await;
         }
 
-        let Self(err) = *self;
-
-        write!(f, "{err}")?;
-
-        if let src @ Some(_) = err.source() {
-            let mut multi_src = false;
-
-            for (i, src) in std::iter::successors(src, |s| s.source()).enumerate() {
-                if i == 0 {
-                    write!(f, "\nCaused by:")?;
-                    multi_src = src.source().is_some();
-                }
-
-                writeln!(f)?;
-                write!(
-                    Indented {
-                        f,
-                        state: if multi_src {
-                            IndentState::NumberStart(i)
-                        } else {
-                            IndentState::PlainStart
-                        },
-                    },
-                    "{src}"
-                )?;
-            }
+        if should_stop_exporter {
+            Self::stop_exporter(exporter, stop_exporter).await;
         }
 
         Ok(())
     }
-}
 
-pub fn run<
-    A: DynHandlerPack<AccountUpdate> + Send + Sync + 'static,
-    X: DynHandlerPack<TransactionUpdate> + Send + Sync + 'static,
->(
-    opts: IndexerOpts,
-    manager: HandlerManagers<A, X>,
-) {
-    match try_run(opts, manager) {
-        Ok(()) => (),
-        Err(e) => {
-            tracing::error!(err = %Chain(&e), "Fatal error encountered");
-            std::process::exit(1);
-        },
-    }
-}
-
-pub fn try_run<
-    A: DynHandlerPack<AccountUpdate> + Send + Sync + 'static,
-    X: DynHandlerPack<TransactionUpdate> + Send + Sync + 'static,
->(
-    opts: IndexerOpts,
-    manager: HandlerManagers<A, X>,
-) -> Result<(), Error> {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(LocalSet::new().run_until(run_async(opts, manager)))
-}
-
-async fn run_async<
-    A: DynHandlerPack<AccountUpdate> + Send + Sync + 'static,
-    X: DynHandlerPack<TransactionUpdate> + Send + Sync + 'static,
->(
-    opts: IndexerOpts,
-    manager: HandlerManagers<A, X>,
-) -> Result<(), Error> {
-    enum StopType<S> {
-        Signal(S),
-        Buffer(Result<std::convert::Infallible, Error>),
-    }
-
-    let IndexerOpts {
-        yellowstone,
-        buffer,
-    } = opts;
-
-    let client = yellowstone::connect(yellowstone, manager.filters()).await?;
-    let signal;
-
-    #[cfg(unix)]
-    {
-        use futures_util::stream::{FuturesUnordered, StreamExt};
-        use tokio::signal::unix::SignalKind;
-
-        let mut stream = [
-            SignalKind::hangup(),
-            SignalKind::interrupt(),
-            SignalKind::quit(),
-            SignalKind::terminate(),
-        ]
-        .into_iter()
-        .map(|k| {
-            tokio::signal::unix::signal(k).map(|mut s| async move {
-                s.recv().await;
-                Ok(k)
-            })
-        })
-        .collect::<Result<FuturesUnordered<_>, _>>()?;
-
-        signal = async move { stream.next().await.transpose() }
-    }
-
-    #[cfg(not(unix))]
-    {
-        use std::fmt;
-
-        use futures_util::TryFutureExt;
-
-        struct CtrlC;
-
-        impl fmt::Debug for CtrlC {
-            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { f.write_str("^C") }
+    async fn stop_buffer(buffer: buffer::Buffer) {
+        match buffer.join().await {
+            Err(e) => tracing::warn!(err = %Chain(&e), "Error stopping runtime buffer"),
+            Ok(c) => c.as_unit(),
         }
-
-        signal = tokio::signal::ctrl_c()
-            .map_ok(|()| Some(CtrlC))
-            .map_err(Into::into);
     }
 
-    let buffer = buffer::run_yellowstone(buffer, client, manager).wait_for_stop();
+    async fn stop_exporter(
+        exporter: OptionFuture<
+            tokio::task::JoinHandle<Result<StopCode, <M::Exporter as Exporter>::Error>>,
+        >,
+        tx: StopTx,
+    ) {
+        tx.maybe_send();
 
-    let ret = tokio::select! {
-        s = signal => StopType::Signal(s),
-        b = buffer => StopType::Buffer(b),
-    };
+        let res = tokio::select! {
+            e = exporter => Some(e),
+            () = tokio::time::sleep(std::time::Duration::from_secs(5)) => None,
+        };
 
-    match ret {
-        StopType::Signal(Ok(Some(s))) => {
-            tracing::warn!("{s:?} received, shutting down...");
-            Ok(())
-        },
-        StopType::Signal(Ok(None)) => Err(std::io::Error::new(
-            std::io::ErrorKind::BrokenPipe,
-            "Signal handler returned None",
-        )
-        .into()),
-        // Not sure why the compiler couldn't figure this one out
-        StopType::Buffer(Ok(o)) => match o {},
-        StopType::Signal(Err(e)) | StopType::Buffer(Err(e)) => Err(e),
+        'unpack: {
+            let Some(res) = res else {
+                tracing::warn!("Metrics exporter took too long to stop");
+                break 'unpack;
+            };
+
+            let Some(res) = res else { break 'unpack };
+
+            match res {
+                Err(e) => {
+                    tracing::warn!(
+                        err = %Chain(&e),
+                        "Metrics exporter panicked after stop requested",
+                    );
+                },
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        err = %Chain(&e),
+                        "Metrics exporter returned an error after stop requested",
+                    );
+                },
+                Ok(Ok(c)) => c.as_unit(),
+            };
+        }
     }
 }
