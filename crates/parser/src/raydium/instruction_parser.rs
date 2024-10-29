@@ -20,11 +20,11 @@ impl Parser for InstructionParser {
     type Input = InstructionUpdate;
     type Output = RaydiumProgramIx;
 
-    fn id(&self) -> Cow<str> { "yellowstone_vixen_parser::jup_programs::InstructionParser".into() }
+    fn id(&self) -> Cow<str> { "yellowstone_vixen_parser::raydium::InstructionParser".into() }
 
     fn prefilter(&self) -> Prefilter {
         Prefilter::builder()
-            .account_owners([RADIUM_V3_PROGRAM_ID])
+            .transaction_accounts([RADIUM_V3_PROGRAM_ID])
             .build()
             .unwrap()
     }
@@ -105,6 +105,21 @@ impl InstructionParser {
 
             _ => Err(ParseError::from("Unknown instruction")),
         }
+    }
+}
+
+#[cfg(feature = "proto")]
+mod proto_parser {
+    use yellowstone_vixen_core::proto::ParseProto;
+    use yellowstone_vixen_proto::parser::RaydiumProgramIxProto;
+
+    use super::InstructionParser;
+    use crate::helpers::IntoProto;
+
+    impl ParseProto for InstructionParser {
+        type Message = RaydiumProgramIxProto;
+
+        fn output_into_message(value: Self::Output) -> Self::Message { value.into_proto() }
     }
 }
 

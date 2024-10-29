@@ -18,13 +18,11 @@ impl Parser for InstructionParser {
     type Input = InstructionUpdate;
     type Output = OrcaProgramIx;
 
-    fn id(&self) -> Cow<str> {
-        "yellowstone_vixen_parser::jup_programs::orca::InstructionParser".into()
-    }
+    fn id(&self) -> Cow<str> { "yellowstone_vixen_parser::orca::InstructionParser".into() }
 
     fn prefilter(&self) -> yellowstone_vixen_core::Prefilter {
         yellowstone_vixen_core::Prefilter::builder()
-            .account_owners([orca_whirlpools_client::ID])
+            .transaction_accounts([orca_whirlpools_client::ID])
             .build()
             .unwrap()
     }
@@ -111,6 +109,21 @@ impl InstructionParser {
             },
             _ => Err(ParseError::from("Unknown instruction")),
         }
+    }
+}
+
+#[cfg(feature = "proto")]
+mod proto_parser {
+    use yellowstone_vixen_core::proto::ParseProto;
+    use yellowstone_vixen_proto::parser::OrcaProgramIxProto;
+
+    use super::InstructionParser;
+    use crate::helpers::IntoProto;
+
+    impl ParseProto for InstructionParser {
+        type Message = OrcaProgramIxProto;
+
+        fn output_into_message(value: Self::Output) -> Self::Message { value.into_proto() }
     }
 }
 
